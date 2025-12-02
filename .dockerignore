@@ -1,0 +1,73 @@
+# ---------------------------------------------
+# Python noise
+# ---------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+*.db
+
+# ---------------------------------------------
+# Virtual environments
+# ---------------------------------------------
+env/
+venv/
+.myenv/
+myenv/
+.venv/
+*.env
+*.egg-info/
+dist/
+build/
+
+# ---------------------------------------------
+# OS & editor junk
+# ---------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ---------------------------------------------
+# HuggingFace cache & model artifacts
+# ---------------------------------------------
+~/.cache/
+~/.local/
+~/.huggingface/
+huggingface/
+hf_cache/
+hf_models/
+cache/
+cache_dir/
+
+# ---------------------------------------------
+# Large training folders (your project has these!)
+# ---------------------------------------------
+neural_network_train/training_images/
+
+# ---------------------------------------------
+# Old predictor scripts
+# ---------------------------------------------
+deprecated_*/
+deprecated*
+deprecated_detecting_open_model.py
+deprecated_watermarking_open_model.py
+
+# ---------------------------------------------
+# Large image folders
+# ---------------------------------------------
+sift_image_editable/*.png
+sift_image_editable/*.jpg
+sift_image_editable/sample*
+
+# ---------------------------------------------
+# API runtime ignore
+# ---------------------------------------------
+*.ipynb
+logs/
+tmp/
+temp/
