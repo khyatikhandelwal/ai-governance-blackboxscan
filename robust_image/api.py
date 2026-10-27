@@ -1,6 +1,6 @@
 """
 API for Generating Watermarked AI Images + Running Detection
-Uses your existing:
+Uses existing:
 - PostProcessWatermarker.py
 - PostProcessDetector.py
 """
@@ -14,17 +14,34 @@ from PIL import Image
 import torch
 import numpy as np
 
-# ---- Import your existing modules ----
+# ---- Import existing modules ----
 import sys, os
 
-sys.path.append("/Users/khyatikhandelwal/ai_governance_prototype/neural_network_train")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
 
 from PostProcessWatermarker import RobustPostProcessWatermarker
 from PostProcessDetector import RobustPostProcessDetector
 
-# ---- OpenAI ----
+import requests
 from openai import OpenAI
-client = OpenAI(api_key="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")
+
+# dall-e-2 / dall-e-3 were shut down on 2026-05-12 and gpt-image-1 on 2026-10-23.
+# Set IMAGE_MODEL to whatever OpenAI currently recommends:
+# https://developers.openai.com/api/docs/deprecations
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2.5-sunburst")
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
+
+_client = None
+
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set on the server.")
+        _client = OpenAI(api_key=api_key)
+    return _client
 
 # =====================================================
 # FastAPI Setup
@@ -59,8 +76,8 @@ WATERMARKER = RobustPostProcessWatermarker(
     watermark_key=DEFAULT_KEY
 )
 WATERMARKER.load_weights(
-    encoder_path="./trained_weights/encoder.pth",
-    decoder_path="./trained_weights/decoder.pth"
+    encoder_path=os.path.join(BASE_DIR, "trained_weights", "encoder.pth"),
+    decoder_path=os.path.join(BASE_DIR, "trained_weights", "decoder.pth")
 )
 
 # --- Detector ---
@@ -68,7 +85,7 @@ DETECTOR = RobustPostProcessDetector(
     device=DEVICE,
     watermark_key=DEFAULT_KEY
 )
-DETECTOR.load_weights("./trained_weights/decoder.pth")
+DETECTOR.load_weights(os.path.join(BASE_DIR, "trained_weights", "decoder.pth"))
 
 
 # =====================================================
@@ -99,28 +116,25 @@ def generate_image(payload: GenerateRequest):
     prompt = payload.prompt
 
     # ---- Generate image using OpenAI ----
-    response = client.images.generate(
-        model="dall-e-2",
+    # No `response_format` (GPT Image models reject it); handle b64 or URL responses.
+    response = get_client().images.generate(
+        model=IMAGE_MODEL,
         prompt=prompt,
-        size="1024x1024"
+        size=IMAGE_SIZE
     )
 
     data = response.data[0]
 
-    # ---------------------------
-    #  FIX: handle both formats
-    # ---------------------------
-    if hasattr(data, "b64_json") and data.b64_json:
-        # base64 directly
+    if getattr(data, "b64_json", None):
         b64_image = data.b64_json
-        unwatermarked_img = base64_to_pil(b64_image)
+        unwatermarked_img = base64_to_pil(b64_image).convert("RGB")
 
-    elif hasattr(data, "url") and data.url:
-        # need to download the URL
-        import requests
-        img_bytes = requests.get(data.url).content
+    elif getattr(data, "url", None):
+        r = requests.get(data.url, timeout=60)
+        r.raise_for_status()
+        img_bytes = r.content
         b64_image = base64.b64encode(img_bytes).decode()
-        unwatermarked_img = Image.open(io.BytesIO(img_bytes))
+        unwatermarked_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
     else:
         raise RuntimeError("OpenAI did not return an image URL or base64 data.")

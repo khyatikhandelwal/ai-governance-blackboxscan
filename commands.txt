@@ -1,0 +1,10 @@
+Google cloud deployment with env keys
+
+gcloud run deploy watermark-api \      
+  --source . \
+  --platform managed \
+  --region us-central1 \
+  --memory 2Gi \
+  --allow-unauthenticated \
+  --set-env-vars OPENAI_API_KEY=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 \
+  --set-env-vars HF_TOKEN=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

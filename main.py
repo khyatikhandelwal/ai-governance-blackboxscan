@@ -8,6 +8,8 @@ from PIL import Image
 import numpy as np
 import torch
 import os
+import math
+import requests
 
 # ============================================================
 #  IMPORTS (relative paths, Cloud-Run friendly)
@@ -96,38 +98,82 @@ FREQ_DET = {
     "dct": FrequencyDomainDetector(method="dct"),
 }
 
-# ------------- Text Watermarking -------------
-# ------------- Text Watermarking (LAZY LOADED) -------------
-DEFAULT_TEXT_MODEL = "gpt2"
-HF_TOKEN = "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"
+# ------------- Text Watermarking (lazy-loaded, any HF causal LM) -------------
+DEFAULT_TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt2")
+HF_TOKEN = os.getenv("HF_TOKEN")  # optional: only needed for gated/private models
 
-text_tokenizer = None
-text_model = None
+# Optional allowlist so public callers can't make the server download huge models.
+# e.g. ALLOWED_TEXT_MODELS="gpt2,distilgpt2,facebook/opt-125m"
+_allowed = os.getenv("ALLOWED_TEXT_MODELS")
+ALLOWED_TEXT_MODELS = {m.strip() for m in _allowed.split(",") if m.strip()} if _allowed else None
 
-def load_gpt2():
-    """Lazy-load GPT-2 with HF token support. Called only on text endpoints."""
-    global text_tokenizer, text_model
+_TEXT_MODEL_CACHE = {}  # { model_name: (tokenizer, model) }
 
-    if text_tokenizer is not None and text_model is not None:
-        return text_tokenizer, text_model
 
-    from huggingface_hub import login
+def load_text_model(model_name: str = None):
+    """Lazy-load and cache a HF causal LM. The token (if any) is passed per call, never stored in code."""
+    model_name = (model_name or "").strip() or DEFAULT_TEXT_MODEL
 
-    hf_token = HF_TOKEN
-    if hf_token:
-        login(hf_token)
+    if ALLOWED_TEXT_MODELS is not None and model_name not in ALLOWED_TEXT_MODELS:
+        raise ValueError(f"Model '{model_name}' is not allowed. Allowed: {sorted(ALLOWED_TEXT_MODELS)}")
 
-    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_TEXT_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(DEFAULT_TEXT_MODEL).to(DEVICE)
+    if model_name in _TEXT_MODEL_CACHE:
+        return _TEXT_MODEL_CACHE[model_name]
 
-    text_tokenizer = tokenizer
-    text_model = model
+    kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs).to(DEVICE)
+    model.eval()
+
+    _TEXT_MODEL_CACHE[model_name] = (tokenizer, model)
     return tokenizer, model
 
 
-# OpenAI client
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ------------- OpenAI image generation (lazy client) -------------
+# NOTE: dall-e-2 / dall-e-3 were shut down on 2026-05-12, and gpt-image-1 on 2026-10-23.
+# Set IMAGE_MODEL in the environment to whatever OpenAI currently recommends
+# (see https://developers.openai.com/api/docs/deprecations).
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2.5-sunburst")
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
+
+_openai_client = None
+
+def get_openai_client() -> OpenAI:
+    """Created on first use so the service still boots (e.g. text endpoints) without a key."""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set on the server.")
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
+
+
+def generate_image_b64(prompt: str) -> str:
+    """
+    Generate an image and return it as a base64 PNG/JPEG string.
+    Deliberately does NOT send `response_format`: GPT Image models reject it
+    (they always return b64_json). Older models returned a URL, so handle both.
+    """
+    resp = get_openai_client().images.generate(
+        model=IMAGE_MODEL,
+        prompt=prompt,
+        size=IMAGE_SIZE,
+    )
+    item = resp.data[0]
+
+    if getattr(item, "b64_json", None):
+        return item.b64_json
+
+    if getattr(item, "url", None):
+        r = requests.get(item.url, timeout=60)
+        r.raise_for_status()
+        return base64.b64encode(r.content).decode()
+
+    raise RuntimeError("OpenAI returned neither base64 data nor a URL.")
+
 
 # ============================================================
 #  SECTION 1: ROBUST IMAGE WATERMARKING
@@ -136,14 +182,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 @app.post("/robust/generate")
 def robust_generate(prompt: str = Form(...)):
     try:
-        resp = client.images.generate(
-            model="dall-e-2",
-            prompt=prompt,
-            size="1024x1024",
-            response_format="b64_json"
-        )
-
-        b64_unwm = resp.data[0].b64_json
+        b64_unwm = generate_image_b64(prompt)
         img_unwm = b64_to_pil(b64_unwm)
 
         img_wm = rpw.embed(img_unwm)
@@ -157,26 +196,25 @@ def robust_generate(prompt: str = Form(...)):
         return {"error": str(e)}
 
 def make_json_safe(obj):
-    """Recursively convert ANY object into fully JSON-safe Python primitives."""
-    
-    # None, int, float, str, bool
-    if isinstance(obj, (int, float, str, bool)) or obj is None:
+    """Recursively convert ANY object into fully JSON-safe Python primitives (NaN/inf -> None)."""
+
+    # None, bool, int, str
+    if obj is None or isinstance(obj, (bool, int, str)):
         return obj
-    
-    # Numpy scalar
-    if "numpy" in str(type(obj)).lower():
-        try:
-            return obj.item()
-        except:
-            return float(obj)
-    
-    # Numpy array
+
+    # float: NaN / inf are not valid JSON and make FastAPI return a 500
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+
+    # Numpy scalar / array
+    if isinstance(obj, np.generic):
+        return make_json_safe(obj.item())
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    
+        return make_json_safe(obj.tolist())
+
     # Torch tensor
     if hasattr(obj, "detach") and hasattr(obj, "cpu"):
-        return obj.detach().cpu().tolist()
+        return make_json_safe(obj.detach().cpu().tolist())
 
     # List or tuple
     if isinstance(obj, (list, tuple)):
@@ -186,7 +224,7 @@ def make_json_safe(obj):
     if isinstance(obj, dict):
         return {str(k): make_json_safe(v) for k, v in obj.items()}
 
-    # Everything else → string
+    # Everything else -> string
     return str(obj)
 
 
@@ -217,14 +255,10 @@ def freq_generate(
     strength: float = Form(0.25)
 ):
     try:
-        resp = client.images.generate(
-            model="dall-e-2",
-            prompt=prompt,
-            response_format="b64_json",
-            size="1024x1024"
-        )
+        if method not in FREQ_WM:
+            return {"error": f"Invalid method '{method}'. Use one of {list(FREQ_WM)}"}
 
-        b64_unwm = resp.data[0].b64_json
+        b64_unwm = generate_image_b64(prompt)
         img_unwm = b64_to_pil(b64_unwm)
 
         wm = FREQ_WM[method]
@@ -248,9 +282,11 @@ def freq_detect(
 ):
     try:
         img = Image.open(io.BytesIO(file.file.read())).convert("RGB")
+        if method not in FREQ_DET:
+            return {"error": f"Invalid method '{method}'. Use one of {list(FREQ_DET)}"}
         det = FREQ_DET[method]
         res = det.detect(img, verbose=False)
-        return res
+        return make_json_safe(res)
     except Exception as e:
         return {"error": str(e)}
 
@@ -262,6 +298,7 @@ def freq_detect(
 @app.post("/text/generate")
 def text_generate(
     prompt: str = Form(...),
+    model_name: str = Form(None),          # defaults to TEXT_MODEL env var / "gpt2"
     max_new_tokens: int = Form(60),
     top_k: int = Form(50),
     temperature: float = Form(1.0),
@@ -270,8 +307,8 @@ def text_generate(
     H: int = Form(4),
 ):
     try:
+        tokenizer, model = load_text_model(model_name)
         sampler = TournamentSampler(key=key, m=m, H=H)
-        tokenizer, model = load_gpt2()
         text = sampler.generate_with_tournament(
             model, tokenizer,
             prompt=prompt,
@@ -280,10 +317,14 @@ def text_generate(
             temperature=temperature,
             device=DEVICE
         )
-        det = TournamentWatermarkDetector(text_tokenizer, key=key, m=m, H=H)
+        det = TournamentWatermarkDetector(tokenizer, key=key, m=m, H=H)
         stats = det.detect(text)
 
-        return {"generated_text": text, "detection": stats}
+        return {
+            "model_name": (model_name or "").strip() or DEFAULT_TEXT_MODEL,
+            "generated_text": text,
+            "detection": make_json_safe(stats),
+        }
 
     except Exception as e:
         return {"error": str(e)}
@@ -292,14 +333,15 @@ def text_generate(
 @app.post("/text/detect")
 def text_detect(
     text: str = Form(...),
+    model_name: str = Form(None),          # must match the model used to generate
     key: str = Form("secret-key-42"),
     m: int = Form(3),
     H: int = Form(4)
 ):
     try:
-        tokenizer, _ = load_gpt2()
+        tokenizer, _ = load_text_model(model_name)
         det = TournamentWatermarkDetector(tokenizer, key=key, m=m, H=H)
-        return det.detect(text)
+        return make_json_safe(det.detect(text))
     except Exception as e:
         return {"error": str(e)}
 
@@ -313,6 +355,8 @@ def root():
     return {
         "status": "running",
         "device": DEVICE,
+        "image_model": IMAGE_MODEL,
+        "text_model_default": DEFAULT_TEXT_MODEL,
         "endpoints": [
             "/robust/generate", "/robust/detect",
             "/freq/generate", "/freq/detect",

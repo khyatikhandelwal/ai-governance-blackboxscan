@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 import os
+import math
+import requests
 
 from openai import OpenAI
 
@@ -16,10 +18,37 @@ from detect import FrequencyDomainDetector
 
 
 # --------------------------------------------
-# OpenAI client
+# OpenAI client (key comes from the environment, never from code)
 # --------------------------------------------
+# dall-e-2 / dall-e-3 were shut down on 2026-05-12 and gpt-image-1 on 2026-10-23.
+# Set IMAGE_MODEL to whatever OpenAI currently recommends:
+# https://developers.openai.com/api/docs/deprecations
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2.5-sunburst")
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
 
-client = OpenAI(api_key="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")
+_client = None
+
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set on the server.")
+        _client = OpenAI(api_key=api_key)
+    return _client
+
+
+def generate_image_b64(prompt: str) -> str:
+    """No `response_format` (GPT Image models reject it); handle b64 or URL responses."""
+    resp = get_client().images.generate(model=IMAGE_MODEL, prompt=prompt, size=IMAGE_SIZE)
+    item = resp.data[0]
+    if getattr(item, "b64_json", None):
+        return item.b64_json
+    if getattr(item, "url", None):
+        r = requests.get(item.url, timeout=60)
+        r.raise_for_status()
+        return base64.b64encode(r.content).decode()
+    raise RuntimeError("OpenAI returned neither base64 data nor a URL.")
 
 
 # --------------------------------------------
@@ -93,14 +122,7 @@ async def generate_image(
 
     try:
         # 1. Generate image from OpenAI
-        response = client.images.generate(
-            model="dall-e-2",
-            prompt=prompt,
-            size="1024x1024",
-            response_format="b64_json",
-        )
-
-        b64_unwm = response.data[0].b64_json
+        b64_unwm = generate_image_b64(prompt)
         img_unwm = base64_to_pil(b64_unwm)
 
         # 2. Apply frequency-domain watermark
@@ -169,15 +191,19 @@ async def detect_image(
         det = DETECTORS[method]
         res = det.detect(img, verbose=False)
 
+        def _f(x):
+            x = float(x)
+            return x if math.isfinite(x) else None
+
         return {
             "is_watermarked": bool(res["is_watermarked"]),
             "method": method,
-            "correlation": float(res["correlation"]),
-            "correlation_p_value": float(res["correlation_p_value"]),
-            "bit_accuracy": float(res["bit_accuracy"]),
+            "correlation": _f(res["correlation"]),
+            "correlation_p_value": _f(res["correlation_p_value"]),
+            "bit_accuracy": _f(res["bit_accuracy"]),
             "matching_bits": int(res["matching_bits"]),
             "total_bits": int(res["total_bits"]),
-            "confidence": float(res["confidence"]),
+            "confidence": _f(res["confidence"]),
         }
 
     except Exception as e:

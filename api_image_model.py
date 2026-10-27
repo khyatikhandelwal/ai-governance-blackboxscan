@@ -29,7 +29,7 @@ async def train_watermarked_model(
     train_dir: str = Form(...),
     output_dir: str = Form("./watermarked_models"),
     repo_id: str = Form(...),   # e.g. "khyatikhandelwal/sd21-watermarked"
-    hf_token: str = Form(...),  # can also load from env
+    hf_token: str = Form(None),  # optional; falls back to the HF_TOKEN env var
     num_iterations: int = Form(100),
     batch_size: int = Form(4),
     learning_rate: float = Form(1e-5),
@@ -39,6 +39,14 @@ async def train_watermarked_model(
     Fine-tune Stable Diffusion VAE decoder to embed a watermark,
     save the model, and upload to HuggingFace Hub.
     """
+
+    # Prefer the server's env var over tokens sent through a public form.
+    hf_token = hf_token or os.getenv("HF_TOKEN")
+    if not hf_token:
+        return JSONResponse(
+            {"status": "error", "message": "No Hugging Face token: set HF_TOKEN on the server (needed to upload)."},
+            status_code=400,
+        )
 
     try:
         # -------------------------------

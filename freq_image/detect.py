@@ -188,13 +188,24 @@ class FrequencyDomainDetector:
     # ===================================================
     def compute_correlation(self, vals):
         vals = np.asarray(vals, dtype=np.float32)
+
+        # Constant / empty signal (e.g. no SIFT keypoints found) -> correlation is
+        # undefined (NaN), which breaks JSON serialization. Treat it as "no evidence".
+        if vals.size < 3 or not np.all(np.isfinite(vals)) or float(vals.std()) < 1e-8:
+            return 0.0, 1.0
+
         vals_n = vals - vals.mean()
         vals_n = vals_n / (vals.std() + 1e-8)
         corr = np.corrcoef(vals_n, self.key_bipolar)[0, 1]
 
+        if not np.isfinite(corr):
+            return 0.0, 1.0
+
         n = len(vals)
         t = corr * np.sqrt(n - 2) / np.sqrt(1 - corr**2 + 1e-8)
         p = 2 * (1 - stats.t.cdf(abs(t), n - 2))
+        if not np.isfinite(p):
+            p = 1.0
         return float(corr), float(p)
 
     def compute_bit_accuracy(self, vals):
