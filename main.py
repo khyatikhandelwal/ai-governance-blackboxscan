@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import os
 import math
+import threading
 import requests
 
 # ============================================================
@@ -108,6 +109,7 @@ _allowed = os.getenv("ALLOWED_TEXT_MODELS")
 ALLOWED_TEXT_MODELS = {m.strip() for m in _allowed.split(",") if m.strip()} if _allowed else None
 
 _TEXT_MODEL_CACHE = {}  # { model_name: (tokenizer, model) }
+_TEXT_MODEL_LOCK = threading.Lock()  # stops concurrent requests from loading the same model twice
 
 
 def load_text_model(model_name: str = None):
@@ -120,15 +122,30 @@ def load_text_model(model_name: str = None):
     if model_name in _TEXT_MODEL_CACHE:
         return _TEXT_MODEL_CACHE[model_name]
 
-    kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
-    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs).to(DEVICE)
-    model.eval()
+    with _TEXT_MODEL_LOCK:
+        # Re-check: another request may have finished loading while we waited for the lock
+        if model_name in _TEXT_MODEL_CACHE:
+            return _TEXT_MODEL_CACHE[model_name]
 
-    _TEXT_MODEL_CACHE[model_name] = (tokenizer, model)
-    return tokenizer, model
+        kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # low_cpu_mem_usage=False -> weights are fully materialised on CPU, no "meta" tensors,
+        # so the .to(DEVICE) below can't hit "Cannot copy out of meta tensor; no data!".
+        # (Fine for small/medium models; for very large ones use device_map instead.)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            low_cpu_mem_usage=False,
+            torch_dtype=torch.float32,
+            **kwargs,
+        )
+        model = model.to(DEVICE)
+        model.eval()
+
+        _TEXT_MODEL_CACHE[model_name] = (tokenizer, model)
+        return tokenizer, model
 
 
 # ------------- OpenAI image generation (lazy client) -------------

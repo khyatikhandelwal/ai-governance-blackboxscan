@@ -26,6 +26,13 @@ RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
 # ===========================================
+# 3b) Bake the default text model into the image
+#     (no download at request time -> no slow/failed cold start)
+# ===========================================
+ENV HF_HOME=/app/hf_cache
+RUN python -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('gpt2'); AutoModelForCausalLM.from_pretrained('gpt2')"
+
+# ===========================================
 # 4) Expose port for Cloud Run
 # ===========================================
 EXPOSE 8080
